@@ -185,10 +185,6 @@ future!"
 	(insert (format "[[%s][%s]]" link name))
       link)))
 
-(defvar gnorb-org-window-conf nil
-  "Save org-buffer window configuration here, for restoration
-  after the mail is sent.")
-
 (defun gnorb-org-restore-after-send ()
   "After an email is sent, clean up the gnus summary buffer, put
 us back where we came from, and go through all the org ids that
@@ -196,12 +192,13 @@ might have been in the outgoing message's headers and call
 `gnorb-org-do-restore-action' on each one."
   (when (eq major-mode 'gnus-summary-mode)
     (gnus-summary-exit nil t))
-  (when (window-configuration-p gnorb-org-window-conf)
-    (set-window-configuration gnorb-org-window-conf))
+  (when (and (window-configuration-p gnorb-window-conf)
+	     gnorb-return-marker)
+    (set-window-configuration gnorb-window-conf)
+    (goto-char gnorb-return-marker))
   (dolist (id gnorb-message-org-ids)
     (gnorb-trigger-todo-action nil id))
   ;; this is a little unnecessary, but it may save grief
-  (setq gnorb-org-window-conf nil)
   (setq gnorb-gnus-sending-message-info nil)
   (setq gnorb-message-org-ids nil))
 
@@ -405,26 +402,31 @@ Org heading ids, associating the outgoing message with those
 headings."
   (require 'gnorb-gnus)
   (if (not messages)
-      ;; either compose new message...
+      ;; Either compose new message...
       (compose-mail (mapconcat 'identity mails ", "))
-    ;; ...or follow link and start reply
+    ;; ...or follow link and start reply.
     (condition-case err
-	(progn
-	  (org-gnus-open (org-link-unescape (car messages)))
+	(let ((ret-val (org-gnus-open (org-link-unescape (car messages)))))
+	  ;; We failed to open the link (probably), ret-val would be
+	  ;; t otherwise
+	  (when (stringp ret-val)
+	    (error ret-val))
 	  (call-interactively
 	   'gnus-summary-wide-reply-with-original)
-	  ;; add MAILS to message To header
+	  ;; Add MAILS to message To header.
 	  (when mails
 	    (message-goto-to)
 	    (insert ", ")
 	    (insert (mapconcat 'identity mails ", "))))
-      (error (when (window-configuration-p gnorb-org-window-conf)
-	       (set-window-configuration gnorb-org-window-conf))
+      (error (when (and (window-configuration-p gnorb-window-conf)
+			gnorb-return-marker)
+	       (set-window-configuration gnorb-window-conf)
+	       (goto-char gnorb-return-marker))
 	     (signal (car err) (cdr err)))))
-  ;; return us after message is sent
+  ;; Return us after message is sent.
   (add-to-list 'message-exit-actions
 	       'gnorb-org-restore-after-send t)
-  ;; set headers from MAIL_* properties (from, cc, and bcc)
+  ;; Set headers from MAIL_* properties (from, cc, and bcc).
   (cl-flet ((sh (h)
 		(when (cdr h)
 		  (funcall (intern (format "message-goto-%s" (car h))))
@@ -489,7 +491,8 @@ current heading."
 (defun gnorb-org-handle-mail (&optional arg text file)
   "Handle current headline as a mail TODO."
   (interactive "P")
-  (setq gnorb-org-window-conf (current-window-configuration))
+  (setq gnorb-window-conf (current-window-configuration))
+  (move-marker gnorb-return-marker (point))
   (when (eq major-mode 'org-agenda-mode)
     (org-agenda-check-type t 'agenda 'timeline 'todo 'tags)
     (org-agenda-check-no-diary)
@@ -565,7 +568,7 @@ current heading."
 		     (list
 		      (file-name-nondirectory
 		       (buffer-file-name
-			(current-buffer))))
+			(org-base-buffer (current-buffer)))))
 		     (org-get-outline-path)
 		     (list
 		      (org-no-properties
@@ -709,7 +712,8 @@ default set of parameters."
 		     ,@opts
 		     ,gnorb-org-email-subtree-file-parameters))))
 	 text file)
-    (setq gnorb-org-window-conf (current-window-configuration))
+    (setq gnorb-window-conf (current-window-configuration))
+    (move-marker gnorb-return-marker (point))
     (if (bufferp result)
 	(setq text result)
       (setq file result))
@@ -834,7 +838,8 @@ This won't work unless you've added a \"nngnorb\" server to
 your gnus select methods."
   ;; this should also work on the active region, if there is one.
   (interactive)
-  (setq gnorb-org-window-conf (current-window-configuration))
+  (setq gnorb-window-conf (current-window-configuration))
+  (move-marker gnorb-return-marker (point))
   (when (eq major-mode 'org-agenda-mode)
     (org-agenda-check-type t 'agenda 'timeline 'todo 'tags)
     (org-agenda-check-no-diary)
@@ -848,11 +853,13 @@ your gnus select methods."
   (let (id)
     (save-excursion
       (org-back-to-heading)
-      (setq id (concat "id+" (org-id-get-create t))))
+      (setq id (concat "id+" (org-id-get-create))))
     (gnorb-gnus-search-messages
      id
-     `(when (window-configuration-p gnorb-org-window-conf)
-	(set-window-configuration gnorb-org-window-conf)))))
+     `(when (and (window-configuration-p gnorb-window-conf)
+		 gnorb-return-marker)
+	(set-window-configuration gnorb-window-conf)
+	(goto-char gnorb-return-marker)))))
 
 (provide 'gnorb-org)
 ;;; gnorb-org.el ends here

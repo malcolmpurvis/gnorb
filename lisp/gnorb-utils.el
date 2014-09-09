@@ -79,7 +79,15 @@
   ;; on whether the message in question has an Org id header. Then
   ;; `gnorb-org-restore-after-send' checks for it and acts
   ;; appropriately, then sets it to nil.
-)
+  )
+
+(defvar gnorb-window-conf nil
+  "Save window configurations here, for restoration after mails
+are sent, or Org headings triggered.")
+
+(defvar gnorb-return-marker (make-marker)
+  "Return point here after various actions, to be used together
+with `gnorb-window-conf'.")
 
 (defcustom gnorb-mail-header "X-Org-ID"
   "Name of the mail header used to store the ID of a related Org
@@ -131,6 +139,12 @@ the prefix arg."
       (when sent-id
 	(org-entry-add-to-multivalued-property
 	 root-marker gnorb-org-msg-id-key sent-id)
+	(gnorb-gnus-make-registry-entry
+	 sent-id
+	 (plist-get gnorb-gnus-sending-message-info :from)
+	 (plist-get gnorb-gnus-sending-message-info :subject)
+	 (org-id-get)
+	 (plist-get gnorb-gnus-sending-message-info :group))
 	(gnorb-org-add-id-hash-entry sent-id root-marker))
       (setq action (cond ((not
 			   (or (and ret-dest-todo
@@ -184,6 +198,51 @@ the prefix arg."
 	       (string-match "^<?bbdb:" addr))
 	  (push (substring addr (match-end 0)) bbdb))))
       `(:gnus ,gnus :mail ,mail :bbdb ,bbdb))))
+
+(defun gnorb-msg-id-to-link (msg-id)
+  (let ((server-group (gnorb-msg-id-to-group msg-id)))
+    (when server-group
+      (org-link-escape (concat server-group "#" msg-id)))))
+
+(defun gnorb-msg-id-to-group (msg-id)
+  "Given only a message id, try a few different things to
+reconstruct a complete org link, including server and group. So
+far we're only checking the registry, and also notmuch if notmuch
+is in use. Other search engines? Other clever methods?"
+  ;; The real problem here is how to get stuff into the registry? If
+  ;; we're using a local archive method, we can force the addition
+  ;; when the message is sent. But if we're not (ie nnimap), then it's
+  ;; pretty rare that the the user is going to go to the sent message
+  ;; folder and open the messages so that they're entered into the
+  ;; registry. That probably means hooking into some fairly low-level
+  ;; processing: allowing users to specify which mailboxes hold their
+  ;; sent mail, and then watching to see any time messages are put
+  ;; into those boxes, and adding them to the registry. One bonus
+  ;; should be, if incoming sent messages are then split, the registry
+  ;; will notice them and add their group key.
+  (let (server-group)
+    (catch 'found
+      (when gnus-registry-enabled
+	;; The following is a cheap knock-off of
+	;; `gnus-try-warping-via-registry'. I can't use that, though,
+	;; because it isn't low-level enough -- it starts with a
+	;; message under point and ends by opening the message in the
+	;; group.
+	(setq server-group
+	      (gnus-registry-get-id-key msg-id 'group))
+	;; If the id is registered at all, group will be a list. If it
+	;; isn't, group stays nil.
+	(when (consp server-group)
+	  (dolist (g server-group)
+	    ;; Get past UNKNOWN and nil group values.
+	    (unless (or (null g)
+			(and (stringp g)
+			     (string-match-p "UNKNOWN" g)))
+	      (setq server-group g)
+	      (throw 'found server-group)))))
+      (when (featurep 'notmuch)
+	t)) ;; Is this even feasible? I suspect not.
+    server-group))
 
 (provide 'gnorb-utils)
 ;;; gnorb-utils.el ends here

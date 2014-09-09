@@ -31,6 +31,13 @@
 (declare-function org-gnus-follow-link "org-gnus"
 		  (group article))
 
+;; This prevents gnorb-related registry entries from being pruned.
+;; Probably we should provide for some backup pruning routine, so we
+;; don't stuff up the whole registry.
+(eval-after-load "gnus-registry"
+  '(when gnus-registry-enabled
+     (add-to-list 'gnus-registry-extra-entries-precious 'gnorb-ids)))
+
 (defgroup gnorb-gnus nil
   "The Gnus bits of Gnorb."
   :tag "Gnorb Gnus"
@@ -233,9 +240,44 @@ save them into `gnorb-tmp-dir'."
 
 ;;; Storing, removing, and acting on Org headers in messages.
 
+(defun gnorb-gnus-capture-registry ()
+  "When capturing from a gnus message, add our new org heading id
+to the message's registry entry, under the 'gnorb-ids key."
+  (when (and (with-current-buffer
+		 (org-capture-get :original-buffer)
+	       (memq major-mode '(gnus-summary-mode gnus-article-mode)))
+	     (not org-note-abort)
+	     gnus-registry-enabled)
+    (let* ((msg-id
+	    (concat "<" (plist-get org-store-link-plist :message-id) ">"))
+	   (entry (gnus-registry-get-or-make-entry msg-id))
+	   (org-ids
+	    (gnus-registry-get-id-key msg-id 'gnorb-ids))
+	   (new-org-id (org-id-get-create)))
+      (setq org-ids (cons new-org-id org-ids))
+      (setq org-ids (delete-dups org-ids))
+      (gnus-registry-set-id-key msg-id 'gnorb-ids org-ids))))
+
+(add-hook 'org-capture-prepare-finalize-hook
+	  'gnorb-gnus-capture-registry)
+
 (defvar gnorb-gnus-sending-message-info nil
   "Place to store the To, Subject, Date, and Message-ID headers
   of the currently-sending or last-sent message.")
+
+(defun gnorb-gnus-make-registry-entry (msg-id sender subject org-id group)
+  "Create a gnus-registry entry for a message, either received or
+sent. Save the relevant Org ids in the 'gnorb-ids key."
+  (when gnus-registry-enabled
+    ;; This set-id-key stuff is actually horribly
+    ;; inefficient.
+    (gnus-registry-get-or-make-entry msg-id)
+    (gnus-registry-set-id-key msg-id 'sender (list sender))
+    (gnus-registry-set-id-key msg-id 'subject (list subject))
+    (gnus-registry-set-id-key msg-id 'gnorb-ids (if (stringp org-id)
+						    (list org-id)
+						  org-id))
+    (gnus-registry-set-id-key msg-id 'group (list group))))
 
 (defun gnorb-gnus-check-outgoing-headers ()
   "Save the value of the `gnorb-mail-header' for the current
@@ -244,6 +286,7 @@ information about the outgoing message into
 `gnorb-gnus-sending-message-info'."
   (save-restriction
     (message-narrow-to-headers)
+    (setq gnorb-gnus-sending-message-info nil)
     (let* ((org-ids (mail-fetch-field gnorb-mail-header nil nil t))
 	   (msg-id (mail-fetch-field "Message-ID"))
 	   (refs (mail-fetch-field "References"))
@@ -254,16 +297,20 @@ information about the outgoing message into
 	   (subject (mail-fetch-field "Subject"))
 	   (date (mail-fetch-field "Date"))
 	   ;; If we can get a link, that's awesome.
-	   (link (or (and (mail-fetch-field "Gcc")
+	   (gcc (mail-fetch-field "Gcc"))
+	   (link (or (and gcc
 			  (org-store-link nil))
-		     nil)))
-      ;; If we can't, then save some information so we can fake it.
+		     nil))
+	   (group (ignore-errors (car (split-string link "#")))))
+      ;; If we can't make a real link, then save some information so
+      ;; we can fake it.
       (when refs
 	(setq refs (split-string refs)))
       (setq gnorb-gnus-sending-message-info
 	    `(:subject ,subject :msg-id ,msg-id
 		       :to ,to :from ,from
-		       :link ,link :date ,date :refs ,refs))
+		       :link ,link :date ,date :refs ,refs
+		       :group ,group))
       (if org-ids
 	  (progn
 	    (require 'gnorb-org)
@@ -302,7 +349,7 @@ the outgoing message will still be available -- nothing else will
 work."
   (interactive "P")
   (let ((org-refile-targets gnorb-gnus-trigger-refile-targets)
-	header-ids ref-ids rel-headings gnorb-org-window-conf
+	header-ids ref-ids rel-headings gnorb-window-conf
 	reply-id reply-group)
     (when arg
       (setq rel-headings
@@ -398,6 +445,7 @@ work."
   (unless gnorb-gnus-new-todo-capture-key
     (error "No capture template key set, customize gnorb-gnus-new-todo-capture-key"))
   (let* ((link (plist-get gnorb-gnus-sending-message-info :link))
+	 (group (plist-get gnorb-gnus-sending-message-info :group))
 	 (date (plist-get gnorb-gnus-sending-message-info :date))
 	 (date-ts (and date
 		       (ignore-errors
@@ -410,6 +458,8 @@ work."
 			     (org-time-stamp-format t t)
 			     (date-to-time date)))))
 	 (msg-id (plist-get gnorb-gnus-sending-message-info :msg-id))
+	 (sender (plist-get gnorb-gnus-sending-message-info :from))
+	 (subject (plist-get gnorb-gnus-sending-message-info :subject))
 	 ;; Convince Org we already have a link stored, even if we
 	 ;; don't.
 	 (org-capture-link-is-already-stored t))
@@ -423,25 +473,24 @@ work."
 	 :date-timestamp-inactive date-ts-ia
 	 :annotation link)
       (org-store-link-props
-	    :subject (plist-get gnorb-gnus-sending-message-info :subject)
-	    :to (plist-get gnorb-gnus-sending-message-info :to)
-	    :date date
-	    :date-timestamp date-ts
-	    :date-timestamp-inactive date-ts-ia
-	    :message-id msg-id
-	    :annotation link))
+       :subject (plist-get gnorb-gnus-sending-message-info :subject)
+       :to (plist-get gnorb-gnus-sending-message-info :to)
+       :date date
+       :date-timestamp date-ts
+       :date-timestamp-inactive date-ts-ia
+       :message-id msg-id
+       :annotation link))
     (org-capture nil gnorb-gnus-new-todo-capture-key)
     (when msg-id
-      (org-entry-put (point) gnorb-org-msg-id-key msg-id))
-    ;; It would be better to only do this if we knew the capture went
-    ;; through, ie wasn't aborted.
-    (setq gnorb-gnus-sending-message-info nil)))
+      (org-entry-put (point) gnorb-org-msg-id-key msg-id)
+      (gnorb-org-add-id-hash-entry msg-id)
+      (gnorb-gnus-make-registry-entry msg-id sender subject (org-id-get-create) group))))
 
 ;;; If an incoming message should trigger state-change for a Org todo,
 ;;; call this function on it.
 
 ;;;###autoload
-(defun gnorb-gnus-incoming-do-todo (arg &optional id)
+(defun gnorb-gnus-incoming-do-todo (arg headers &optional id)
   "Call this function from a received gnus message to store a
 link to the message, prompt for a related Org heading, visit the
 heading, and either add a note or trigger a TODO state change.
@@ -456,15 +505,20 @@ there match the value of the `gnorb-org-msg-id-key' property for
 any headings. In order for this to work, you will have to have
 loaded org-id, and have the variable `org-id-track-globally' set
 to t (it is, by default)."
-  (interactive "P")
+  (interactive (gnus-interactive "P\nH"))
   (when (not (memq major-mode '(gnus-summary-mode gnus-article-mode)))
     (user-error "Only works in gnus summary or article mode"))
   ;; We should only store a link if it's not already at the head of
   ;; `org-stored-links'. There's some duplicate storage, at
   ;; present. Take a look at calling it non-interactively.
   (call-interactively 'org-store-link)
-  (setq gnorb-org-window-conf (current-window-configuration))
-  (let* ((org-refile-targets gnorb-gnus-trigger-refile-targets)
+  (setq gnorb-window-conf (current-window-configuration))
+  (move-marker gnorb-return-marker (point))
+  (let* ((msg-id (mail-header-id headers))
+	 (sender (mail-header-from headers))
+	 (subject (mail-header-subject headers))
+	 (group gnus-newsgroup-name)
+	 (org-refile-targets gnorb-gnus-trigger-refile-targets)
 	 ;; otherwise `gnorb-trigger-todo-action' will think we
 	 ;; started from an outgoing message
 	 (gnorb-gnus-sending-message-info nil)
@@ -501,7 +555,9 @@ to t (it is, by default)."
     (message
      "Insert a link to the message with org-insert-link (%s)"
      (key-description
-		(where-is-internal 'org-insert-link nil t)))))
+      (where-is-internal 'org-insert-link nil t)))
+    (gnorb-gnus-make-registry-entry
+     msg-id sender subject (org-id-get-create) group)))
 
 ;;;###autoload
 (defun gnorb-gnus-search-messages (str &optional ret)
@@ -569,7 +625,11 @@ option `gnorb-gnus-hint-relevant-article' is non-nil."
 	(setq ref-ids (split-string ref-ids))
        (when (setq rel-headings
 		   (gnorb-org-find-visit-candidates ref-ids))
-	 (message "Possible relevant TODO: %s, trigger with %s"
+	 (message "Possible relevant todo (%s): %s, trigger with %s"
+		  (org-with-point-at (org-id-find
+				      (caar rel-headings) t)
+		    (org-element-property
+		     :todo-keyword (org-element-at-point)))
 		  (org-format-outline-path
 		   (cadr (car rel-headings)))
 		  (if key
